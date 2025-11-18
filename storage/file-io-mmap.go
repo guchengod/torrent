@@ -43,6 +43,24 @@ type mmapFileIo struct {
 	paths map[string]*fileMmap
 }
 
+func (me *mmapFileIo) rename(from, to string) (err error) {
+	me.mu.Lock()
+	defer me.mu.Unlock()
+	me.close(from)
+	me.close(to)
+	return os.Rename(from, to)
+}
+
+func (me *mmapFileIo) close(name string) {
+	v, ok := me.paths[name]
+	if ok {
+		// We're forcibly closing the handle. Leave the store's ref intact so we're the only one
+		// that closes it, then delete it anyway.
+		panicif.Err(v.close())
+		g.MustDelete(me.paths, name)
+	}
+}
+
 func (me *mmapFileIo) flush(name string, offset, nbytes int64) error {
 	// Since we are only flushing writes that we created, and we don't currently unmap files after
 	// we've opened them, then if the mmap doesn't exist yet then there's nothing to flush.
@@ -59,7 +77,10 @@ func (me *mmapFileIo) flush(name string, offset, nbytes int64) error {
 	return msync(v.m, int(offset), int(nbytes))
 }
 
+// Shared file access.
 type fileMmap struct {
+	// Read lock held for each reference. Write lock taken for destructive action like close.
+	mu       sync.RWMutex
 	m        mmap.MMap
 	f        *os.File
 	refs     atomic.Int32
@@ -74,6 +95,9 @@ func (me *fileMmap) dec() error {
 }
 
 func (me *fileMmap) close() (err error) {
+	// I can't see any way to avoid this. We need to forcibly alter the actual state of the handle underneath other consumers to kick them off.
+	me.mu.Lock()
+	defer me.mu.Unlock()
 	return errors.Join(me.m.Unmap(), me.f.Close())
 }
 
@@ -125,6 +149,7 @@ func (me *mmapFileIo) openForWrite(name string, size int64) (_ fileWriter, err e
 			v.inc()
 			return newMmapFile(v), nil
 		} else {
+			// Drop the cache ref. We aren't presuming to require it to be closed here, hmm...
 			v.dec()
 			g.MustDelete(me.paths, name)
 		}
@@ -160,8 +185,13 @@ func (me *mmapFileIo) openForWrite(name string, size int64) (_ fileWriter, err e
 }
 
 func newMmapFile(f *fileMmap) *mmapSharedFileHandle {
+	//panicif.False(f.mu.TryRLock())
 	ret := &mmapSharedFileHandle{
 		f: f,
+		close: sync.OnceValue[error](func() error {
+			//defer f.mu.RUnlock()
+			return f.dec()
+		}),
 	}
 	ret.f.inc()
 	return ret
@@ -184,7 +214,7 @@ var _ fileIo = (*mmapFileIo)(nil)
 
 type mmapSharedFileHandle struct {
 	f     *fileMmap
-	close sync.Once
+	close func() error
 }
 
 func (me *mmapSharedFileHandle) WriteAt(p []byte, off int64) (n int, err error) {
@@ -207,11 +237,8 @@ func (me *mmapSharedFileHandle) ReadAt(p []byte, off int64) (n int, err error) {
 	return
 }
 
-func (me *mmapSharedFileHandle) Close() (err error) {
-	me.close.Do(func() {
-		err = me.f.dec()
-	})
-	return
+func (me *mmapSharedFileHandle) Close() error {
+	return me.close()
 }
 
 type mmapFileHandle struct {
@@ -231,13 +258,19 @@ func (me *mmapFileHandle) WriteTo(w io.Writer) (n int64, err error) {
 }
 
 func (me *mmapFileHandle) writeToN(w io.Writer, n int64) (written int64, err error) {
+	mu := &me.shared.f.mu
+	// If this panics we need a close error.
+	//panicif.False(mu.TryRLock())
+	mu.RLock()
 	b := me.shared.f.m
+	panicif.Nil(b) // It's been closed and we need to signal that.
 	if me.pos >= int64(len(b)) {
 		return
 	}
 	b = b[me.pos:]
 	b = b[:min(int64(len(b)), n)]
 	i, err := w.Write(b)
+	mu.RUnlock()
 	written = int64(i)
 	me.pos += written
 	return
@@ -264,7 +297,12 @@ func (me *mmapFileHandle) seekDataOrEof(offset int64) (ret int64, err error) {
 	// This should be fine as it's an atomic operation, on a shared file handle, so nobody will be
 	// relying non-atomic operations on the file. TODO: Does this require msync first so we don't
 	// skip our own writes.
+
+	//  We do need to protect the file descriptor as that's not synchronized outside os.File. If
+	//  it's already closed before we call this, that's fine, we'll get EBADF
+	panicif.False(me.shared.f.mu.TryRLock())
 	ret, err = seekData(me.shared.f.f, offset)
+	me.shared.f.mu.RUnlock()
 	if err == nil {
 		me.pos = ret
 	} else if err == io.EOF {
